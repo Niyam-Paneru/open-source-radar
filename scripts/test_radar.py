@@ -9,9 +9,81 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import call, patch
+from urllib.error import HTTPError, URLError
 
 import radar
+
+
+class GitHubRequestTests(unittest.TestCase):
+    url = "https://api.github.com/graphql"
+
+    def http_error(self, status, headers=None):
+        return HTTPError(self.url, status, "error", headers or {}, io.BytesIO(b"request failed"))
+
+    def test_retry_after_header_is_honored(self):
+        error = self.http_error(429, {"Retry-After": "7"})
+        response = io.BytesIO(b'{"ok": true}')
+        with (
+            patch("radar.urllib.request.urlopen", side_effect=[error, response]) as urlopen,
+            patch("radar.time.sleep") as sleep,
+        ):
+            self.assertEqual(radar.GitHub("test-token").graphql("query {}"), {"ok": True})
+
+        sleep.assert_called_once_with(8.0)
+        self.assertEqual(urlopen.call_count, 2)
+        for args in urlopen.call_args_list:
+            request = args.args[0]
+            self.assertEqual(request.full_url, self.url)
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(request.data, b'{"query": "query {}"}')
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            self.assertEqual(args.kwargs, {"timeout": 60})
+
+    def test_primary_rate_limit_waits_until_reset(self):
+        error = self.http_error(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "130"})
+        with patch("radar.time.time", return_value=100):
+            self.assertEqual(radar.GitHub._rate_limit_wait(error), 32.0)
+        with patch("radar.time.time", return_value=140):
+            self.assertEqual(radar.GitHub._rate_limit_wait(error), 1.0)
+
+    def test_secondary_rate_limit_without_headers_uses_fallback(self):
+        error = self.http_error(429)
+        self.assertEqual(radar.GitHub._rate_limit_wait(error), 60.0)
+
+    def test_transient_http_and_network_failures_back_off_then_recover(self):
+        failures = [self.http_error(503), URLError("offline"), io.BytesIO(b'{"ok": true}')]
+        with (
+            patch("radar.urllib.request.urlopen", side_effect=failures) as urlopen,
+            patch("radar.time.sleep") as sleep,
+        ):
+            self.assertEqual(radar.GitHub("test-token").graphql("query {}"), {"ok": True})
+
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(1), call(2)])
+
+    def test_permanent_http_error_is_not_retried(self):
+        with (
+            patch("radar.urllib.request.urlopen", side_effect=self.http_error(404)) as urlopen,
+            patch("radar.time.sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "404 request failed"),
+        ):
+            radar.GitHub("test-token").graphql("query {}")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_retry_budget_is_bounded(self):
+        failures = [self.http_error(503) for _ in range(6)]
+        with (
+            patch("radar.urllib.request.urlopen", side_effect=failures) as urlopen,
+            patch("radar.time.sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "503 request failed"),
+        ):
+            radar.GitHub("test-token").graphql("query {}")
+
+        self.assertEqual(urlopen.call_count, 6)
+        self.assertEqual(sleep.call_args_list, [call(1), call(2), call(4), call(8), call(16)])
 
 
 class JsonHelpersTests(unittest.TestCase):
