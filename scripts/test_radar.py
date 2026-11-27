@@ -51,6 +51,23 @@ class GitHubRequestTests(unittest.TestCase):
         error = self.http_error(429)
         self.assertEqual(radar.GitHub._rate_limit_wait(error), 60.0)
 
+    def test_secondary_rate_limit_403_is_detected_from_the_message(self):
+        error = self.http_error(403)
+        self.assertEqual(radar.GitHub._rate_limit_wait(error, "You have exceeded a secondary rate limit."), 60.0)
+        self.assertIsNone(radar.GitHub._rate_limit_wait(error, "Resource not accessible by integration"))
+
+    def test_forbidden_without_rate_limit_is_not_retried(self):
+        error = HTTPError(self.url, 403, "error", {}, io.BytesIO(b"Bad credentials"))
+        with (
+            patch("radar.urllib.request.urlopen", side_effect=error) as urlopen,
+            patch("radar.time.sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "403 Bad credentials"),
+        ):
+            radar.GitHub("test-token").graphql("query {}")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
     def test_transient_http_and_network_failures_back_off_then_recover(self):
         failures = [self.http_error(503), URLError("offline"), io.BytesIO(b'{"ok": true}')]
         with (
